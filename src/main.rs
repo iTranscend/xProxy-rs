@@ -1,8 +1,8 @@
 use anyhow::*;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Error, Request, Server};
+use hyper::{Body, Client, Error, Request, Response, Server};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 fn mutate_request(req: &mut Request<Body>) -> Result<()> {
     // Stripping off unnecessary headers
@@ -24,17 +24,19 @@ fn mutate_request(req: &mut Request<Body>) -> Result<()> {
         None => format!("https://www.upwork.com{}", uri.path()),
         Some(query) => format!("https://www.upwork.com{}{}", uri.path(), query),
     };
-    println!("URI: {}", &uri_string);
+    // println!("URI: {}", &uri_string);
     *req.uri_mut() = uri_string
         .parse()
         .context("parsing the uri in mutate_request")?;
     Ok(())
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let https = hyper_rustls::HttpsConnector::with_native_roots();
     let client: Client<_, hyper::Body> = Client::builder().build(https);
     let client: Arc<Client<_, hyper::Body>> = Arc::new(client);
+    let stats: Arc<RwLock<Stats>> = Arc::new(RwLock::new(Stats { proxied: 0 }));
 
     // Server-side listener
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
@@ -42,16 +44,27 @@ async fn main() -> Result<()> {
     // Make service to handle each connection
     let make_svc = make_service_fn(move |_| {
         let client = Arc::clone(&client);
+        let stats = Arc::clone(&stats);
         async move {
             Ok::<_, Error>(service_fn(move |mut req| {
                 let client = Arc::clone(&client);
+                let stats = Arc::clone(&stats);
                 async move {
-                    mutate_request(&mut req)?;
-                    client
-                        .request(req)
-                        .await
-                        .context("Sending request to backend server")
+                    if req.uri().path() == "/status" {
+                        let stats: &Stats = &stats.read().unwrap();
+                        let body: Body = format!("{:?}", stats).into();
+                        Ok(Response::new(body))
+                    } else {
+                        println!("Proxied: {}", req.uri().path());
+                        stats.write().unwrap().proxied += 1;
+                        mutate_request(&mut req)?;
+                        client
+                            .request(req)
+                            .await
+                            .context("Sending request to backend server")
+                    }
                 }
+                // Stats tracking
             }))
         }
     });
@@ -61,4 +74,9 @@ async fn main() -> Result<()> {
         .context("500: Internal Server error")?;
 
     Ok::<(), anyhow::Error>(())
+}
+
+#[derive(Debug)]
+struct Stats {
+    proxied: usize,
 }
